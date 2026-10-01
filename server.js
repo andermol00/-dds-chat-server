@@ -13,6 +13,8 @@ const PORT = process.env.PORT || 3000;
 const TTL_MS        = parseInt(process.env.TTL_HOURS  || '12') * 60 * 60 * 1000;
 const MAX_MSGS      = parseInt(process.env.MAX_MSGS   || '500');
 const MAX_TOPICS    = parseInt(process.env.MAX_TOPICS || '50');
+const MAX_IMAGE_BYTES = 1024 * 1024; // 1024 KB máximo por imagen
+const MAX_ATTACHMENTS = parseInt(process.env.MAX_ATTACHMENTS || '250');
 const SSE_HEARTBEAT = 20000;   // 20 s — Railway corta conexiones idle a los 30 s
 
 /* ============================================================
@@ -34,6 +36,7 @@ app.use(express.text({ limit: '64kb' }));
 // presence: Map<topicId, { users: Map<userId, obj>, clients: Set }>
 const chatTopics     = new Map();
 const presenceTopics = new Map();
+const attachments    = new Map(); // id -> { buffer, mime, name, size, ts }
 
 function getChatTopic(id) {
   if (!chatTopics.has(id)) {
@@ -76,9 +79,17 @@ setInterval(() => {
   // Presencia expirada
   for (const [id, t] of presenceTopics) {
     for (const [uid, u] of t.users) {
-      if (now - u.at > (u.ttl || 90) * 1000 + 15000) t.users.delete(uid);
+      const retention = u.status === 'offline'
+        ? 5 * 60 * 1000
+        : (u.ttl || 90) * 1000 + 15000;
+      if (now - u.at > retention) t.users.delete(uid);
     }
-    if (t.users.size === 0 && t.clients.size === 0) presenceTopics.delete(id);
+      if (t.users.size === 0 && t.clients.size === 0) presenceTopics.delete(id);
+  }
+
+  // Archivos temporales: solo memoria, sin base de datos
+  for (const [id, a] of attachments) {
+    if (now - a.ts > TTL_MS) attachments.delete(id);
   }
 }, 5 * 60 * 1000);
 
@@ -145,6 +156,8 @@ app.get('/health', (_req, res) => {
     presence:      presenceTopics.size,
     totalMsgs,
     totalClients,
+    attachments:    attachments.size,
+    maxImageKB:     MAX_IMAGE_BYTES / 1024,
     memoryMB:      (process.memoryUsage().heapUsed / 1048576).toFixed(1),
     ttlHours:      TTL_MS / 3600000
   });
@@ -313,7 +326,15 @@ app.post('/presence/:topicId', (req, res) => {
   const now   = Date.now();
 
   if (payload.s === 'offline') {
-    topic.users.delete(payload.u);
+    // Conservamos el estado unos minutos para que los demás puedan verlo como OFFLINE.
+    const previous = topic.users.get(payload.u);
+    topic.users.set(payload.u, {
+      id: payload.u,
+      name: (payload.n || previous?.name || payload.u).slice(0, 32),
+      status: 'offline',
+      at: now,
+      ttl: Math.min(payload.ttl || 90, 300)
+    });
   } else {
     topic.users.set(payload.u, {
       id:     payload.u,
@@ -340,7 +361,8 @@ app.get('/presence/:topicId/sse', (req, res) => {
 
   // Enviar usuarios activos al conectar
   for (const [, u] of topic.users) {
-    if (now - u.at < u.ttl * 1000 + 15000) {
+    const retention = u.status === 'offline' ? 5 * 60 * 1000 : u.ttl * 1000 + 15000;
+    if (now - u.at < retention) {
       const ev = { t:'presence', u:u.id, n:u.name, s:u.status,
                    at:u.at, ttl:u.ttl, v:'server' };
       res.write('data: ' + JSON.stringify(
@@ -379,7 +401,8 @@ app.get('/presence/:topicId/poll', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   for (const [, u] of topic.users) {
-    if (now - u.at < u.ttl * 1000 + 15000) {
+    const retention = u.status === 'offline' ? 5 * 60 * 1000 : u.ttl * 1000 + 15000;
+    if (now - u.at < retention) {
       const ev = { t:'presence', u:u.id, n:u.name, s:u.status,
                    at:u.at, ttl:u.ttl, v:'server' };
       res.write(JSON.stringify(
@@ -388,6 +411,104 @@ app.get('/presence/:topicId/poll', (req, res) => {
     }
   }
   res.end();
+});
+
+/* ============================================================
+   RUTAS — IMÁGENES
+   Máximo estricto: 1024 KB por archivo. Solo memoria.
+============================================================ */
+app.put('/attachments/:id', express.raw({
+  type: '*/*',
+  limit: '1024kb'
+}), (req, res) => {
+  const id = String(req.params.id || '');
+  if (!/^[a-zA-Z0-9_-]{8,80}$/.test(id))
+    return res.status(400).json({ error: 'ID de archivo inválido' });
+
+  const mime = String(req.headers['content-type'] || '').split(';')[0].toLowerCase();
+  if (!mime.startsWith('image/'))
+    return res.status(415).json({ error: 'Solo se permiten imágenes' });
+
+  const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+  if (!buf.length)
+    return res.status(400).json({ error: 'Archivo vacío' });
+  if (buf.length > MAX_IMAGE_BYTES)
+    return res.status(413).json({ error: 'La imagen supera el límite de 1024 KB' });
+
+  // Evitar crecimiento indefinido de memoria.
+  if (attachments.size >= MAX_ATTACHMENTS) {
+    const oldest = attachments.keys().next().value;
+    if (oldest) attachments.delete(oldest);
+  }
+
+  const filename = String(req.headers.filename || 'imagen').slice(0, 120);
+  attachments.set(id, {
+    buffer: buf,
+    mime,
+    name: filename,
+    size: buf.length,
+    ts: Date.now()
+  });
+
+  res.json({
+    ok: true,
+    id,
+    size: buf.length,
+    maxBytes: MAX_IMAGE_BYTES,
+    attachment: { url: '/attachments/' + id }
+  });
+});
+
+app.get('/attachments/:id', (req, res) => {
+  const a = attachments.get(String(req.params.id || ''));
+  if (!a) return res.status(404).json({ error: 'Imagen no encontrada o expirada' });
+
+  res.setHeader('Content-Type', a.mime);
+  res.setHeader('Content-Length', String(a.size));
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader('Content-Disposition', `inline; filename="${a.name.replace(/["\\r\\n]/g, '_')}"`);
+  res.send(a.buffer);
+});
+
+app.get('/presence/:topicId/users', (req, res) => {
+  const { topicId } = req.params;
+  if (!isValidTopic(topicId))
+    return res.status(400).json({ error: 'Topic inválido' });
+
+  const topic = getPresenceTopic(topicId);
+  const now = Date.now();
+  const users = [];
+
+  for (const [, u] of topic.users) {
+    const retention = u.status === 'offline'
+      ? 5 * 60 * 1000
+      : (u.ttl || 90) * 1000 + 15000;
+    if (now - u.at <= retention) {
+      users.push({
+        id: u.id,
+        name: u.name,
+        status: u.status || 'offline',
+        at: u.at,
+        ttl: u.ttl
+      });
+    }
+  }
+
+  users.sort((a,b) => {
+    const rank = s => s === 'online' ? 0 : s === 'away' ? 1 : 2;
+    return rank(a.status) - rank(b.status) || a.name.localeCompare(b.name);
+  });
+
+  res.json({ users, count: users.length });
+});
+
+/* ============================================================
+   ERRORES DE BODY / ARCHIVOS GRANDES
+============================================================ */
+app.use((err, _req, res, next) => {
+  if (err?.type === 'entity.too.large' || err?.status === 413)
+    return res.status(413).json({ error: 'La imagen supera el límite de 1024 KB' });
+  next(err);
 });
 
 /* ============================================================
